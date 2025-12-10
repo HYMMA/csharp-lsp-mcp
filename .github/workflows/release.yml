@@ -1,0 +1,93 @@
+name: Release to NuGet
+
+on:
+  release:
+    types: [published]
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+  DOTNET_NOLOGO: true
+  NuGetDirectory: ${{ github.workspace }}/nuget
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+
+    - name: Get version from tag
+      id: get_version
+      run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+    - name: Restore dependencies
+      run: dotnet restore csharp-lsp-mcp/CSharpLspMcp.sln
+
+    - name: Build
+      run: dotnet build csharp-lsp-mcp/CSharpLspMcp.sln --configuration Release --no-restore -p:Version=${{ steps.get_version.outputs.VERSION }}
+
+    - name: Test
+      run: dotnet test csharp-lsp-mcp/CSharpLspMcp.sln --configuration Release --no-build --verbosity normal
+
+    - name: Pack
+      run: dotnet pack csharp-lsp-mcp/src/CSharpLspMcp/CSharpLspMcp.csproj --configuration Release --no-build --output ${{ env.NuGetDirectory }} -p:Version=${{ steps.get_version.outputs.VERSION }}
+
+    - name: Upload NuGet package artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: nuget
+        if-no-files-found: error
+        retention-days: 7
+        path: ${{ env.NuGetDirectory }}/*.nupkg
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - name: Download NuGet package artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: nuget
+        path: ${{ env.NuGetDirectory }}
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+
+    - name: Publish to NuGet
+      run: |
+        foreach($file in (Get-ChildItem "${{ env.NuGetDirectory }}" -Recurse -Include *.nupkg)) {
+            dotnet nuget push $file --api-key "${{ secrets.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
+        }
+      shell: pwsh
+
+  # Also publish as a dotnet tool
+  publish-tool:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+
+    - name: Get version from tag
+      id: get_version
+      run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+    - name: Pack as tool
+      run: dotnet pack csharp-lsp-mcp/src/CSharpLspMcp/CSharpLspMcp.csproj --configuration Release --output ./nuget-tool -p:Version=${{ steps.get_version.outputs.VERSION }} -p:PackAsTool=true
+
+    - name: Publish tool to NuGet
+      run: |
+        foreach($file in (Get-ChildItem "./nuget-tool" -Recurse -Include *.nupkg)) {
+            dotnet nuget push $file --api-key "${{ secrets.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
+        }
+      shell: pwsh

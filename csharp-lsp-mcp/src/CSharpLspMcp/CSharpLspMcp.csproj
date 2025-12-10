@@ -7,6 +7,30 @@
     <Nullable>enable</Nullable>
     <RootNamespace>CSharpLspMcp</RootNamespace>
     <AssemblyName>csharp-lsp-mcp</AssemblyName>
+
+    <!-- NuGet Package Properties -->
+    <PackageId>CSharpLspMcp</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>HYMMA</Authors>
+    <Company>HYMMA</Company>
+    <Product>csharp-lsp-mcp</Product>
+    <Description>MCP (Model Context Protocol) server providing C# and XAML language intelligence for AI assistants like Claude. Exposes IntelliSense, diagnostics, and code analysis through the standardized MCP protocol.</Description>
+    <PackageTags>mcp;csharp;dotnet;language-server;claude;ai;xaml;intellisense;roslyn;model-context-protocol</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/HYMMA/csharp-lsp-mcp</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/HYMMA/csharp-lsp-mcp.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+
+    <!-- Tool packaging -->
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>csharp-lsp-mcp</ToolCommandName>
+
+    <!-- Source Link for debugging -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
 
   <ItemGroup>
@@ -15,6 +39,11 @@
     <PackageReference Include="ModelContextProtocol" Version="0.5.0-preview.1" />
     <PackageReference Include="StreamJsonRpc" Version="2.17.8" />
     <PackageReference Include="System.Text.Json" Version="10.0.0" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>
