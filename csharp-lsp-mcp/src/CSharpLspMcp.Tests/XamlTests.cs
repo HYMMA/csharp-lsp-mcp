@@ -1,4 +1,5 @@
 using CSharpLspMcp.Xaml;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace CSharpLspMcp.Tests;
@@ -92,6 +93,34 @@ public class XamlParserTests
     }
 
     [Fact]
+    public void Parse_InvalidXaml_RecoversClassName()
+    {
+        var xaml = "<Window x:Class=\"MyApp.MainWindow\" xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"><Button></Window>";
+
+        var result = _parser.Parse(xaml);
+
+        Assert.NotEmpty(result.ParseErrors);
+        Assert.Equal("MainWindow", result.ClassName);
+        Assert.Equal("MyApp", result.ClassNamespace);
+    }
+
+    [Fact]
+    public void Parse_AttachedProperty_CapturesOwnerAndProperty()
+    {
+        var xaml = "<Grid xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"><Button Grid.Row=\"1\" /></Grid>";
+
+        var result = _parser.Parse(xaml);
+
+        var button = result.Root?.Children.FirstOrDefault();
+        Assert.NotNull(button);
+        var attached = button.Attributes.FirstOrDefault(a => a.Name.Contains("."));
+        Assert.NotNull(attached);
+        Assert.True(attached.IsAttached);
+        Assert.Equal("Grid", attached.OwnerType);
+        Assert.Equal("Row", attached.PropertyName);
+    }
+
+    [Fact]
     public void Parse_ExtractsNamespaces()
     {
         var xaml = "<Window xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\" xmlns:local=\"clr-namespace:MyApp.ViewModels\" xmlns:controls=\"clr-namespace:MyApp.Controls;assembly=MyApp.Controls\"></Window>";
@@ -100,6 +129,21 @@ public class XamlParserTests
 
         Assert.Contains(result.Namespaces, kvp => kvp.Key == "local" && kvp.Value.Contains("MyApp.ViewModels"));
         Assert.Contains(result.Namespaces, kvp => kvp.Key == "controls" && kvp.Value.Contains("MyApp.Controls"));
+    }
+}
+
+public class XamlAnalyzerTests
+{
+    [Fact]
+    public async Task Analyze_EmptyBindingPath_ProducesInfoDiagnostic()
+    {
+        var logger = LoggerFactory.Create(_ => { }).CreateLogger<XamlAnalyzer>();
+        var analyzer = new XamlAnalyzer(logger);
+        var xaml = "<Window xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\"><TextBox Text=\"{Binding}\" /></Window>";
+
+        var result = await analyzer.AnalyzeAsync("test.xaml", xaml, projectPath: null);
+
+        Assert.Contains(result.Diagnostics, d => d.Code == "XAML004");
     }
 }
 

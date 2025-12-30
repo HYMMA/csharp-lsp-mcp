@@ -10,9 +10,9 @@ namespace CSharpLspMcp.Lsp;
 public class LspClient : IAsyncDisposable
 {
     private readonly ILogger<LspClient> _logger;
+    private readonly SolutionFilter _solutionFilter;
     private Process? _lspProcess;
-    private StreamWriter? _writer;
-    private StreamReader? _reader;
+    private Stream? _outputStream;
     private int _requestId;
     private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonElement>> _pendingRequests = new();
     private readonly ConcurrentDictionary<string, PublishDiagnosticsParams> _diagnosticsCache = new();
@@ -21,6 +21,7 @@ public class LspClient : IAsyncDisposable
     private bool _isInitialized;
     private readonly SemaphoreSlim _initLock = new(1, 1);
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private string? _filteredWorkspacePath;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -31,9 +32,10 @@ public class LspClient : IAsyncDisposable
 
     public event Action<PublishDiagnosticsParams>? DiagnosticsReceived;
 
-    public LspClient(ILogger<LspClient> logger)
+    public LspClient(ILogger<LspClient> logger, SolutionFilter solutionFilter)
     {
         _logger = logger;
+        _solutionFilter = solutionFilter;
     }
 
     public async Task<bool> StartAsync(string? workspacePath = null, CancellationToken cancellationToken = default)
@@ -52,6 +54,18 @@ public class LspClient : IAsyncDisposable
                 return false;
             }
 
+            // Filter the solution to exclude unsupported project types
+            var effectiveWorkspacePath = workspacePath;
+            if (workspacePath != null)
+            {
+                _filteredWorkspacePath = _solutionFilter.GetFilteredWorkspacePath(workspacePath);
+                if (_filteredWorkspacePath != workspacePath)
+                {
+                    _logger.LogInformation("Using filtered workspace: {Path}", _filteredWorkspacePath);
+                    effectiveWorkspacePath = _filteredWorkspacePath;
+                }
+            }
+
             _logger.LogInformation("Starting LSP server: {Path}", lspPath);
 
             var startInfo = new ProcessStartInfo
@@ -62,15 +76,14 @@ public class LspClient : IAsyncDisposable
                 RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
-                StandardInputEncoding = Encoding.UTF8,
-                StandardOutputEncoding = Encoding.UTF8,
+                // Don't set encoding - we write bytes directly to avoid BOM issues
             };
 
             _lspProcess = new Process { StartInfo = startInfo };
             _lspProcess.ErrorDataReceived += (_, e) =>
             {
                 if (!string.IsNullOrEmpty(e.Data))
-                    _logger.LogDebug("LSP stderr: {Message}", e.Data);
+                    _logger.LogWarning("LSP stderr: {Message}", e.Data);
             };
 
             if (!_lspProcess.Start())
@@ -79,18 +92,28 @@ public class LspClient : IAsyncDisposable
                 return false;
             }
 
+            _logger.LogDebug("LSP process started, PID: {Pid}", _lspProcess.Id);
             _lspProcess.BeginErrorReadLine();
-            _writer = _lspProcess.StandardInput;
-            _reader = _lspProcess.StandardOutput;
+
+            // Small delay to let the process start
+            await Task.Delay(100, cancellationToken);
+
+            if (_lspProcess.HasExited)
+            {
+                _logger.LogError("LSP process exited immediately with code: {ExitCode}", _lspProcess.ExitCode);
+                return false;
+            }
+            _outputStream = _lspProcess.StandardOutput.BaseStream;
 
             _readLoopCts = new CancellationTokenSource();
             _readLoopTask = Task.Run(() => ReadLoopAsync(_readLoopCts.Token), _readLoopCts.Token);
 
-            // Initialize the LSP server
-            var initResult = await InitializeAsync(workspacePath, cancellationToken);
+            // Initialize the LSP server with the (potentially filtered) workspace
+            var initResult = await InitializeAsync(effectiveWorkspacePath, cancellationToken);
             if (initResult == null)
             {
                 _logger.LogError("LSP initialization failed");
+                await CleanupFailedStartAsync();
                 return false;
             }
 
@@ -104,6 +127,11 @@ public class LspClient : IAsyncDisposable
             _isInitialized = true;
             return true;
         }
+        catch
+        {
+            await CleanupFailedStartAsync();
+            throw;
+        }
         finally
         {
             _initLock.Release();
@@ -113,10 +141,13 @@ public class LspClient : IAsyncDisposable
     private async Task<string?> FindLspServerAsync(CancellationToken cancellationToken)
     {
         // Check common locations for csharp-ls
+        var isWindows = OperatingSystem.IsWindows();
+        var exeExtension = isWindows ? ".exe" : "";
+
         var possiblePaths = new[]
         {
-            "csharp-ls", // In PATH
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotnet", "tools", "csharp-ls"),
+            "csharp-ls", // In PATH (Windows handles .exe automatically)
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotnet", "tools", $"csharp-ls{exeExtension}"),
             "/usr/local/bin/csharp-ls",
             "/usr/bin/csharp-ls"
         };
@@ -154,6 +185,7 @@ public class LspClient : IAsyncDisposable
 
     private async Task<InitializeResult?> InitializeAsync(string? workspacePath, CancellationToken cancellationToken)
     {
+        _logger.LogInformation("InitializeAsync: Sending initialize request to LSP server...");
         var rootUri = workspacePath != null ? new Uri(workspacePath).ToString() : null;
 
         var initParams = new InitializeParams
@@ -200,7 +232,9 @@ public class LspClient : IAsyncDisposable
                 : null
         };
 
+        _logger.LogDebug("InitializeAsync: Workspace folders: {Folders}", workspacePath);
         var response = await SendRequestAsync<InitializeResult>("initialize", initParams, cancellationToken);
+        _logger.LogInformation("InitializeAsync: Received response from LSP server");
         return response;
     }
 
@@ -402,10 +436,12 @@ public class LspClient : IAsyncDisposable
 
         try
         {
+            _logger.LogDebug("SendRequestAsync: Sending request id={Id} method={Method}", id, method);
             await SendMessageAsync(request, cancellationToken);
+            _logger.LogDebug("SendRequestAsync: Request sent, waiting for response...");
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            cts.CancelAfter(TimeSpan.FromSeconds(30));
+            cts.CancelAfter(TimeSpan.FromSeconds(120));
 
             var result = await tcs.Task.WaitAsync(cts.Token);
 
@@ -433,17 +469,19 @@ public class LspClient : IAsyncDisposable
 
     private async Task SendMessageAsync(object message, CancellationToken cancellationToken)
     {
-        if (_writer == null)
+        if (_lspProcess?.StandardInput?.BaseStream == null)
             throw new InvalidOperationException("LSP client not started");
 
         var json = JsonSerializer.Serialize(message, JsonOptions);
+        // Write bytes directly to avoid encoding issues (BOM, etc.)
         var content = $"Content-Length: {Encoding.UTF8.GetByteCount(json)}\r\n\r\n{json}";
+        var bytes = Encoding.UTF8.GetBytes(content);
 
         await _writeLock.WaitAsync(cancellationToken);
         try
         {
-            await _writer.WriteAsync(content);
-            await _writer.FlushAsync(cancellationToken);
+            await _lspProcess.StandardInput.BaseStream.WriteAsync(bytes, cancellationToken);
+            await _lspProcess.StandardInput.BaseStream.FlushAsync(cancellationToken);
             _logger.LogTrace("Sent: {Message}", json);
         }
         finally
@@ -454,53 +492,46 @@ public class LspClient : IAsyncDisposable
 
     private async Task ReadLoopAsync(CancellationToken cancellationToken)
     {
-        if (_reader == null)
+        _logger.LogDebug("ReadLoopAsync: Starting read loop");
+        if (_outputStream == null)
+        {
+            _logger.LogError("ReadLoopAsync: Output stream is null!");
             return;
-
-        var buffer = new StringBuilder();
+        }
 
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                // Read headers
-                var contentLength = -1;
-                while (true)
+                _logger.LogDebug("ReadLoopAsync: Waiting for content length header...");
+                var contentLength = await ReadContentLengthAsync(_outputStream, cancellationToken);
+                if (contentLength == null)
                 {
-                    var line = await _reader.ReadLineAsync(cancellationToken);
-                    if (line == null)
-                        return; // Stream closed
-
-                    if (string.IsNullOrEmpty(line))
-                        break; // End of headers
-
-                    if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        contentLength = int.Parse(line.Substring(15).Trim());
-                    }
+                    _logger.LogWarning("ReadLoopAsync: Stream closed (null content length)");
+                    return; // Stream closed
                 }
 
-                if (contentLength <= 0)
+                _logger.LogDebug("ReadLoopAsync: Content-Length: {Length}", contentLength.Value);
+                if (contentLength.Value <= 0)
                     continue;
 
-                // Read content
-                var chars = new char[contentLength];
-                var totalRead = 0;
-                while (totalRead < contentLength)
+                var payload = new byte[contentLength.Value];
+                var readOk = await ReadExactAsync(_outputStream, payload, payload.Length, cancellationToken);
+                if (!readOk)
                 {
-                    var read = await _reader.ReadAsync(chars.AsMemory(totalRead, contentLength - totalRead), cancellationToken);
-                    if (read == 0)
-                        return; // Stream closed
-                    totalRead += read;
+                    _logger.LogWarning("ReadLoopAsync: Stream closed while reading payload");
+                    return; // Stream closed
                 }
 
-                var json = new string(chars);
+                var json = Encoding.UTF8.GetString(payload);
                 _logger.LogTrace("Received: {Message}", json);
+                _logger.LogDebug("ReadLoopAsync: Received message, length={Length}", json.Length);
 
                 ProcessMessage(json);
             }
             catch (OperationCanceledException)
             {
+                _logger.LogDebug("ReadLoopAsync: Cancelled");
                 break;
             }
             catch (Exception ex)
@@ -508,6 +539,7 @@ public class LspClient : IAsyncDisposable
                 _logger.LogError(ex, "Error in LSP read loop");
             }
         }
+        _logger.LogDebug("ReadLoopAsync: Exiting read loop");
     }
 
     private void ProcessMessage(string json)
@@ -562,6 +594,95 @@ public class LspClient : IAsyncDisposable
         }
     }
 
+    private static async Task<int?> ReadContentLengthAsync(Stream stream, CancellationToken cancellationToken)
+    {
+        var headerBytes = new List<byte>();
+        var lastFour = new byte[4];
+        var lastIndex = 0;
+
+        while (true)
+        {
+            var buffer = new byte[1];
+            var read = await stream.ReadAsync(buffer.AsMemory(0, 1), cancellationToken);
+            if (read == 0)
+                return null;
+
+            var value = buffer[0];
+            headerBytes.Add(value);
+
+            lastFour[lastIndex % 4] = value;
+            lastIndex++;
+
+            if (lastIndex >= 4 &&
+                lastFour[(lastIndex - 4) % 4] == '\r' &&
+                lastFour[(lastIndex - 3) % 4] == '\n' &&
+                lastFour[(lastIndex - 2) % 4] == '\r' &&
+                lastFour[(lastIndex - 1) % 4] == '\n')
+            {
+                break;
+            }
+        }
+
+        var headerText = Encoding.ASCII.GetString(headerBytes.ToArray()).TrimEnd('\r', '\n');
+        var lines = headerText.Split(new[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
+
+        foreach (var line in lines)
+        {
+            if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+            {
+                if (int.TryParse(line.Substring(15).Trim(), out var length))
+                    return length;
+            }
+        }
+
+        return 0;
+    }
+
+    private static async Task<bool> ReadExactAsync(Stream stream, byte[] buffer, int length, CancellationToken cancellationToken)
+    {
+        var totalRead = 0;
+        while (totalRead < length)
+        {
+            var read = await stream.ReadAsync(buffer.AsMemory(totalRead, length - totalRead), cancellationToken);
+            if (read == 0)
+                return false;
+            totalRead += read;
+        }
+
+        return true;
+    }
+
+    private async Task CleanupFailedStartAsync()
+    {
+        _readLoopCts?.Cancel();
+
+        if (_readLoopTask != null)
+        {
+            try
+            {
+                await _readLoopTask.WaitAsync(TimeSpan.FromSeconds(2));
+            }
+            catch { }
+        }
+
+        if (_lspProcess != null && !_lspProcess.HasExited)
+        {
+            try
+            {
+                _lspProcess.Kill();
+            }
+            catch { }
+        }
+
+        _lspProcess?.Dispose();
+        _readLoopCts?.Dispose();
+
+        _outputStream = null;
+        _readLoopCts = null;
+        _readLoopTask = null;
+        _lspProcess = null;
+    }
+
     public async ValueTask DisposeAsync()
     {
         _readLoopCts?.Cancel();
@@ -589,7 +710,6 @@ public class LspClient : IAsyncDisposable
             catch { }
         }
 
-        _writer?.Dispose();
         _lspProcess?.Dispose();
         _readLoopCts?.Dispose();
         _initLock.Dispose();

@@ -297,39 +297,36 @@ public class XamlAnalyzer
 
     private void ValidateBinding(XamlBinding binding, List<XamlDiagnostic> diagnostics)
     {
-        // Check for typos in binding path
-        if (!string.IsNullOrEmpty(binding.Path))
+        if (string.IsNullOrWhiteSpace(binding.Path))
         {
-            var pathSegments = binding.Path.Split('.');
-            foreach (var segment in pathSegments)
+            diagnostics.Add(new XamlDiagnostic
             {
-                foreach (var (typo, correct) in CommonTypos)
-                {
-                    if (segment.Equals(typo, StringComparison.OrdinalIgnoreCase))
-                    {
-                        diagnostics.Add(new XamlDiagnostic
-                        {
-                            Message = $"Possible typo in binding path: '{segment}'. Did you mean '{correct}'?",
-                            Severity = XamlDiagnosticSeverity.Warning,
-                            Line = binding.Line,
-                            Column = binding.Column,
-                            Code = "XAML003"
-                        });
-                    }
-                }
-            }
+                Message = "Binding has empty Path. If intentional, use '{Binding}' without Path.",
+                Severity = XamlDiagnosticSeverity.Info,
+                Line = binding.Line,
+                Column = binding.Column,
+                Code = "XAML004"
+            });
+            return;
+        }
 
-            // Check for empty path (likely a mistake)
-            if (string.IsNullOrWhiteSpace(binding.Path))
+        // Check for typos in binding path
+        var pathSegments = binding.Path.Split('.');
+        foreach (var segment in pathSegments)
+        {
+            foreach (var (typo, correct) in CommonTypos)
             {
-                diagnostics.Add(new XamlDiagnostic
+                if (segment.Equals(typo, StringComparison.OrdinalIgnoreCase))
                 {
-                    Message = "Binding has empty Path. If intentional, use '{Binding}' without Path.",
-                    Severity = XamlDiagnosticSeverity.Info,
-                    Line = binding.Line,
-                    Column = binding.Column,
-                    Code = "XAML004"
-                });
+                    diagnostics.Add(new XamlDiagnostic
+                    {
+                        Message = $"Possible typo in binding path: '{segment}'. Did you mean '{correct}'?",
+                        Severity = XamlDiagnosticSeverity.Warning,
+                        Line = binding.Line,
+                        Column = binding.Column,
+                        Code = "XAML003"
+                    });
+                }
             }
         }
 

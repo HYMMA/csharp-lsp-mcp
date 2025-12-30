@@ -45,7 +45,8 @@ public class Program
 
             builder.Logging.SetMinimumLevel(logLevel);
 
-            // Register LSP client as singleton
+            // Register solution filter and LSP client as singletons
+            builder.Services.AddSingleton<SolutionFilter>();
             builder.Services.AddSingleton<LspClient>();
 
             // Configure MCP server with official SDK

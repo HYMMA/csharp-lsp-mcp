@@ -167,7 +167,7 @@ public class XamlParser
             });
 
             // Try to recover partial information using regex fallback
-            TryRecoverWithRegex(content, result);
+            result = TryRecoverWithRegex(content, result);
 
             return result;
         }
@@ -194,7 +194,7 @@ public class XamlParser
         {
             while (reader.MoveToNextAttribute())
             {
-                var attrName = reader.LocalName;
+                var attrName = reader.Name;
                 var isAttached = attrName.Contains('.');
 
                 string? ownerType = null;
@@ -322,7 +322,7 @@ public class XamlParser
         }
     }
 
-    private void TryRecoverWithRegex(string content, XamlParseResult result)
+    private XamlParseResult TryRecoverWithRegex(string content, XamlParseResult result)
     {
         var lines = content.Split('\n');
 
@@ -361,6 +361,8 @@ public class XamlParser
         {
             ParseBindingsAndResources(lines[i], i + 1, 1, result);
         }
+
+        return result;
     }
 
     private int GetLineNumber(string content, int index)

@@ -30,17 +30,25 @@ public class CSharpTools
         [Description("Path to the solution/project directory")] string path,
         CancellationToken cancellationToken)
     {
-        if (!Directory.Exists(path))
-            return $"Error: Directory does not exist: {path}";
+        try
+        {
+            if (!Directory.Exists(path))
+                return $"Error: Directory does not exist: {path}";
 
-        _workspacePath = path;
+            _workspacePath = path;
 
-        var started = await _lspClient.StartAsync(path, cancellationToken);
+            var started = await _lspClient.StartAsync(path, cancellationToken);
 
-        if (!started)
-            return "Error: Failed to start LSP server. Make sure csharp-ls is installed: dotnet tool install --global csharp-ls";
+            if (!started)
+                return "Error: Failed to start LSP server. Make sure csharp-ls is installed: dotnet tool install --global csharp-ls";
 
-        return $"Workspace set to: {path}\nLSP server started successfully.";
+            return $"Workspace set to: {path}\nLSP server started successfully.";
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error setting workspace to {Path}", path);
+            return $"Error setting workspace: {ex.Message}";
+        }
     }
 
     [McpServerTool(Name = "csharp_diagnostics")]
@@ -50,36 +58,44 @@ public class CSharpTools
         [Description("Content of the file (optional, reads from disk if not provided)")] string? content,
         CancellationToken cancellationToken)
     {
-        var absolutePath = GetAbsolutePath(filePath);
-        await EnsureDocumentOpenAsync(absolutePath, content, cancellationToken);
-
-        var diagnostics = await _lspClient.WaitForDiagnosticsAsync(absolutePath, TimeSpan.FromSeconds(5), cancellationToken);
-
-        if (diagnostics == null || diagnostics.Diagnostics.Length == 0)
-            return "No diagnostics found.";
-
-        var sb = new StringBuilder();
-        sb.AppendLine($"Found {diagnostics.Diagnostics.Length} diagnostic(s):\n");
-
-        foreach (var diag in diagnostics.Diagnostics.OrderBy(d => d.Range.Start.Line))
+        try
         {
-            var severity = diag.Severity switch
+            var absolutePath = GetAbsolutePath(filePath);
+            await EnsureDocumentOpenAsync(absolutePath, content, cancellationToken);
+
+            var diagnostics = await _lspClient.WaitForDiagnosticsAsync(absolutePath, TimeSpan.FromSeconds(5), cancellationToken);
+
+            if (diagnostics == null || diagnostics.Diagnostics.Length == 0)
+                return "No diagnostics found.";
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"Found {diagnostics.Diagnostics.Length} diagnostic(s):\n");
+
+            foreach (var diag in diagnostics.Diagnostics.OrderBy(d => d.Range.Start.Line))
             {
-                DiagnosticSeverity.Error => "ERROR",
-                DiagnosticSeverity.Warning => "WARNING",
-                DiagnosticSeverity.Information => "INFO",
-                DiagnosticSeverity.Hint => "HINT",
-                _ => "UNKNOWN"
-            };
+                var severity = diag.Severity switch
+                {
+                    DiagnosticSeverity.Error => "ERROR",
+                    DiagnosticSeverity.Warning => "WARNING",
+                    DiagnosticSeverity.Information => "INFO",
+                    DiagnosticSeverity.Hint => "HINT",
+                    _ => "UNKNOWN"
+                };
 
-            sb.AppendLine($"[{severity}] Line {diag.Range.Start.Line + 1}, Col {diag.Range.Start.Character + 1}:");
-            sb.AppendLine($"  {diag.Message}");
-            if (diag.Code != null)
-                sb.AppendLine($"  Code: {diag.Code}");
-            sb.AppendLine();
+                sb.AppendLine($"[{severity}] Line {diag.Range.Start.Line + 1}, Col {diag.Range.Start.Character + 1}:");
+                sb.AppendLine($"  {diag.Message}");
+                if (diag.Code != null)
+                    sb.AppendLine($"  Code: {diag.Code}");
+                sb.AppendLine();
+            }
+
+            return sb.ToString();
         }
-
-        return sb.ToString();
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting diagnostics for {FilePath}", filePath);
+            return $"Error getting diagnostics: {ex.Message}";
+        }
     }
 
     [McpServerTool(Name = "csharp_hover")]
