@@ -18,52 +18,81 @@ public class CSharpTools
     private readonly Dictionary<string, DocumentState> _openDocuments = new();
     private string? _workspacePath;
 
+    // Use a separate CTS for LSP operations with a longer timeout
+    // This prevents MCP request cancellation from killing LSP initialization
+    private static readonly TimeSpan LspOperationTimeout = TimeSpan.FromMinutes(3);
+
     public CSharpTools(ILogger<CSharpTools> logger, LspClient lspClient)
     {
         _logger = logger;
         _lspClient = lspClient;
     }
 
+    /// <summary>
+    /// Wraps tool execution to ensure all exceptions are caught and converted to error messages.
+    /// The MCP SDK intercepts OperationCanceledException before our catch blocks, so we need
+    /// to use a separate cancellation token for LSP operations.
+    /// </summary>
+    private async Task<string> ExecuteToolAsync(string toolName, Func<CancellationToken, Task<string>> action, CancellationToken mcpToken)
+    {
+        // Create a linked token that will cancel if either the MCP request is cancelled
+        // or our timeout expires, but use a longer timeout for LSP operations
+        using var cts = new CancellationTokenSource(LspOperationTimeout);
+
+        try
+        {
+            // Use our own token, not the MCP token, to avoid MCP SDK intercepting cancellation
+            return await action(cts.Token);
+        }
+        catch (OperationCanceledException ex)
+        {
+            _logger.LogWarning(ex, "Tool {ToolName} was cancelled", toolName);
+            if (mcpToken.IsCancellationRequested)
+                return $"Error: Operation was cancelled by the client.";
+            return $"Error: Operation timed out after {LspOperationTimeout.TotalSeconds} seconds.";
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error executing tool {ToolName}", toolName);
+            return $"Error: {ex.Message}";
+        }
+    }
+
     [McpServerTool(Name = "csharp_set_workspace")]
     [Description("Set the workspace/solution directory for the C# LSP. Call this first before other operations.")]
-    public async Task<string> SetWorkspaceAsync(
+    public Task<string> SetWorkspaceAsync(
         [Description("Path to the solution/project directory")] string path,
         CancellationToken cancellationToken)
     {
-        try
+        return ExecuteToolAsync("csharp_set_workspace", async ct =>
         {
             if (!Directory.Exists(path))
                 return $"Error: Directory does not exist: {path}";
 
             _workspacePath = path;
 
-            var started = await _lspClient.StartAsync(path, cancellationToken);
+            var started = await _lspClient.StartAsync(path, ct);
 
             if (!started)
                 return "Error: Failed to start LSP server. Make sure csharp-ls is installed: dotnet tool install --global csharp-ls";
 
             return $"Workspace set to: {path}\nLSP server started successfully.";
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error setting workspace to {Path}", path);
-            return $"Error setting workspace: {ex.Message}";
-        }
+        }, cancellationToken);
     }
 
     [McpServerTool(Name = "csharp_diagnostics")]
     [Description("Get compiler errors and warnings for C# code. Opens the document in the LSP if not already open.")]
-    public async Task<string> GetDiagnosticsAsync(
+    public Task<string> GetDiagnosticsAsync(
         [Description("Absolute path to the C# file")] string filePath,
         [Description("Content of the file (optional, reads from disk if not provided)")] string? content,
         CancellationToken cancellationToken)
     {
-        try
+        return ExecuteToolAsync("csharp_diagnostics", async ct =>
         {
             var absolutePath = GetAbsolutePath(filePath);
-            await EnsureDocumentOpenAsync(absolutePath, content, cancellationToken);
+            await EnsureDocumentOpenAsync(absolutePath, content, ct);
 
-            var diagnostics = await _lspClient.WaitForDiagnosticsAsync(absolutePath, TimeSpan.FromSeconds(5), cancellationToken);
+            var diagnostics = await _lspClient.WaitForDiagnosticsAsync(absolutePath, TimeSpan.FromSeconds(5), ct);
 
             if (diagnostics == null || diagnostics.Diagnostics.Length == 0)
                 return "No diagnostics found.";
@@ -90,36 +119,34 @@ public class CSharpTools
             }
 
             return sb.ToString();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error getting diagnostics for {FilePath}", filePath);
-            return $"Error getting diagnostics: {ex.Message}";
-        }
+        }, cancellationToken);
     }
 
     [McpServerTool(Name = "csharp_hover")]
     [Description("Get type information and documentation at a specific position in C# code")]
-    public async Task<string> GetHoverAsync(
+    public Task<string> GetHoverAsync(
         [Description("Absolute path to the C# file")] string filePath,
         [Description("0-based line number")] int line,
         [Description("0-based character position")] int character,
         [Description("Content of the file (optional)")] string? content,
         CancellationToken cancellationToken)
     {
-        var absolutePath = GetAbsolutePath(filePath);
-        await EnsureDocumentOpenAsync(absolutePath, content, cancellationToken);
+        return ExecuteToolAsync("csharp_hover", async ct =>
+        {
+            var absolutePath = GetAbsolutePath(filePath);
+            await EnsureDocumentOpenAsync(absolutePath, content, ct);
 
-        var hover = await _lspClient.GetHoverAsync(absolutePath, line, character, cancellationToken);
-        if (hover == null)
-            return "No hover information available at this position.";
+            var hover = await _lspClient.GetHoverAsync(absolutePath, line, character, ct);
+            if (hover == null)
+                return "No hover information available at this position.";
 
-        return FormatHoverContent(hover.Contents);
+            return FormatHoverContent(hover.Contents);
+        }, cancellationToken);
     }
 
     [McpServerTool(Name = "csharp_completions")]
     [Description("Get IntelliSense completions at a specific position")]
-    public async Task<string> GetCompletionsAsync(
+    public Task<string> GetCompletionsAsync(
         [Description("Absolute path to the C# file")] string filePath,
         [Description("0-based line number")] int line,
         [Description("0-based character position")] int character,
@@ -127,62 +154,68 @@ public class CSharpTools
         [Description("Maximum number of completions to return (default: 20)")] int maxResults = 20,
         CancellationToken cancellationToken = default)
     {
-        var absolutePath = GetAbsolutePath(filePath);
-        await EnsureDocumentOpenAsync(absolutePath, content, cancellationToken);
-
-        var completions = await _lspClient.GetCompletionsAsync(absolutePath, line, character, cancellationToken);
-        if (completions == null || completions.Length == 0)
-            return "No completions available.";
-
-        var sb = new StringBuilder();
-        sb.AppendLine($"Found {completions.Length} completion(s):\n");
-
-        foreach (var item in completions.Take(maxResults))
+        return ExecuteToolAsync("csharp_completions", async ct =>
         {
-            var kind = item.Kind?.ToString() ?? "Unknown";
-            sb.AppendLine($"• {item.Label} ({kind})");
-            if (!string.IsNullOrEmpty(item.Detail))
-                sb.AppendLine($"  {item.Detail}");
-        }
+            var absolutePath = GetAbsolutePath(filePath);
+            await EnsureDocumentOpenAsync(absolutePath, content, ct);
 
-        if (completions.Length > maxResults)
-            sb.AppendLine($"\n... and {completions.Length - maxResults} more");
+            var completions = await _lspClient.GetCompletionsAsync(absolutePath, line, character, ct);
+            if (completions == null || completions.Length == 0)
+                return "No completions available.";
 
-        return sb.ToString();
+            var sb = new StringBuilder();
+            sb.AppendLine($"Found {completions.Length} completion(s):\n");
+
+            foreach (var item in completions.Take(maxResults))
+            {
+                var kind = item.Kind?.ToString() ?? "Unknown";
+                sb.AppendLine($"• {item.Label} ({kind})");
+                if (!string.IsNullOrEmpty(item.Detail))
+                    sb.AppendLine($"  {item.Detail}");
+            }
+
+            if (completions.Length > maxResults)
+                sb.AppendLine($"\n... and {completions.Length - maxResults} more");
+
+            return sb.ToString();
+        }, cancellationToken);
     }
 
     [McpServerTool(Name = "csharp_definition")]
     [Description("Go to definition - find where a symbol is defined")]
-    public async Task<string> GetDefinitionAsync(
+    public Task<string> GetDefinitionAsync(
         [Description("Absolute path to the C# file")] string filePath,
         [Description("0-based line number")] int line,
         [Description("0-based character position")] int character,
         [Description("Content of the file (optional)")] string? content,
         CancellationToken cancellationToken)
     {
-        var absolutePath = GetAbsolutePath(filePath);
-        await EnsureDocumentOpenAsync(absolutePath, content, cancellationToken);
-
-        var locations = await _lspClient.GetDefinitionAsync(absolutePath, line, character, cancellationToken);
-        if (locations == null || locations.Length == 0)
-            return "No definition found.";
-
-        var sb = new StringBuilder();
-        sb.AppendLine($"Found {locations.Length} definition(s):\n");
-
-        foreach (var loc in locations)
+        return ExecuteToolAsync("csharp_definition", async ct =>
         {
-            var path = new Uri(loc.Uri).LocalPath;
-            sb.AppendLine($"• {path}");
-            sb.AppendLine($"  Line {loc.Range.Start.Line + 1}, Col {loc.Range.Start.Character + 1}");
-        }
+            var absolutePath = GetAbsolutePath(filePath);
+            await EnsureDocumentOpenAsync(absolutePath, content, ct);
 
-        return sb.ToString();
+            var locations = await _lspClient.GetDefinitionAsync(absolutePath, line, character, ct);
+            if (locations == null || locations.Length == 0)
+                return "No definition found.";
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"Found {locations.Length} definition(s):\n");
+
+            foreach (var loc in locations)
+            {
+                var path = new Uri(loc.Uri).LocalPath;
+                sb.AppendLine($"• {path}");
+                sb.AppendLine($"  Line {loc.Range.Start.Line + 1}, Col {loc.Range.Start.Character + 1}");
+            }
+
+            return sb.ToString();
+        }, cancellationToken);
     }
 
     [McpServerTool(Name = "csharp_references")]
     [Description("Find all references to a symbol")]
-    public async Task<string> GetReferencesAsync(
+    public Task<string> GetReferencesAsync(
         [Description("Absolute path to the C# file")] string filePath,
         [Description("0-based line number")] int line,
         [Description("0-based character position")] int character,
@@ -190,68 +223,74 @@ public class CSharpTools
         [Description("Include the declaration in results (default: true)")] bool includeDeclaration = true,
         CancellationToken cancellationToken = default)
     {
-        var absolutePath = GetAbsolutePath(filePath);
-        await EnsureDocumentOpenAsync(absolutePath, content, cancellationToken);
-
-        var locations = await _lspClient.GetReferencesAsync(absolutePath, line, character, includeDeclaration, cancellationToken);
-        if (locations == null || locations.Length == 0)
-            return "No references found.";
-
-        var sb = new StringBuilder();
-        sb.AppendLine($"Found {locations.Length} reference(s):\n");
-
-        var grouped = locations.GroupBy(l => new Uri(l.Uri).LocalPath);
-        foreach (var group in grouped)
+        return ExecuteToolAsync("csharp_references", async ct =>
         {
-            sb.AppendLine($"• {group.Key}");
-            foreach (var loc in group.OrderBy(l => l.Range.Start.Line))
-            {
-                sb.AppendLine($"  Line {loc.Range.Start.Line + 1}, Col {loc.Range.Start.Character + 1}");
-            }
-        }
+            var absolutePath = GetAbsolutePath(filePath);
+            await EnsureDocumentOpenAsync(absolutePath, content, ct);
 
-        return sb.ToString();
+            var locations = await _lspClient.GetReferencesAsync(absolutePath, line, character, includeDeclaration, ct);
+            if (locations == null || locations.Length == 0)
+                return "No references found.";
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"Found {locations.Length} reference(s):\n");
+
+            var grouped = locations.GroupBy(l => new Uri(l.Uri).LocalPath);
+            foreach (var group in grouped)
+            {
+                sb.AppendLine($"• {group.Key}");
+                foreach (var loc in group.OrderBy(l => l.Range.Start.Line))
+                {
+                    sb.AppendLine($"  Line {loc.Range.Start.Line + 1}, Col {loc.Range.Start.Character + 1}");
+                }
+            }
+
+            return sb.ToString();
+        }, cancellationToken);
     }
 
     [McpServerTool(Name = "csharp_symbols")]
     [Description("Get all symbols (classes, methods, properties, etc.) in a document")]
-    public async Task<string> GetSymbolsAsync(
+    public Task<string> GetSymbolsAsync(
         [Description("Absolute path to the C# file")] string filePath,
         [Description("Content of the file (optional)")] string? content,
         CancellationToken cancellationToken)
     {
-        var absolutePath = GetAbsolutePath(filePath);
-        await EnsureDocumentOpenAsync(absolutePath, content, cancellationToken);
-
-        var symbols = await _lspClient.GetDocumentSymbolsAsync(absolutePath, cancellationToken);
-        if (symbols == null)
-            return "No symbols found.";
-
-        var sb = new StringBuilder();
-
-        if (symbols is DocumentSymbol[] docSymbols)
+        return ExecuteToolAsync("csharp_symbols", async ct =>
         {
-            sb.AppendLine("Document Symbols:\n");
-            FormatDocumentSymbols(sb, docSymbols, 0);
-        }
-        else if (symbols is SymbolInformation[] symInfos)
-        {
-            sb.AppendLine($"Found {symInfos.Length} symbol(s):\n");
-            foreach (var sym in symInfos)
+            var absolutePath = GetAbsolutePath(filePath);
+            await EnsureDocumentOpenAsync(absolutePath, content, ct);
+
+            var symbols = await _lspClient.GetDocumentSymbolsAsync(absolutePath, ct);
+            if (symbols == null)
+                return "No symbols found.";
+
+            var sb = new StringBuilder();
+
+            if (symbols is DocumentSymbol[] docSymbols)
             {
-                sb.AppendLine($"• {sym.Name} ({sym.Kind})");
-                if (!string.IsNullOrEmpty(sym.ContainerName))
-                    sb.AppendLine($"  Container: {sym.ContainerName}");
-                sb.AppendLine($"  Line {sym.Location.Range.Start.Line + 1}");
+                sb.AppendLine("Document Symbols:\n");
+                FormatDocumentSymbols(sb, docSymbols, 0);
             }
-        }
+            else if (symbols is SymbolInformation[] symInfos)
+            {
+                sb.AppendLine($"Found {symInfos.Length} symbol(s):\n");
+                foreach (var sym in symInfos)
+                {
+                    sb.AppendLine($"• {sym.Name} ({sym.Kind})");
+                    if (!string.IsNullOrEmpty(sym.ContainerName))
+                        sb.AppendLine($"  Container: {sym.ContainerName}");
+                    sb.AppendLine($"  Line {sym.Location.Range.Start.Line + 1}");
+                }
+            }
 
-        return sb.ToString();
+            return sb.ToString();
+        }, cancellationToken);
     }
 
     [McpServerTool(Name = "csharp_code_actions")]
     [Description("Get available code actions (quick fixes, refactorings) for a range")]
-    public async Task<string> GetCodeActionsAsync(
+    public Task<string> GetCodeActionsAsync(
         [Description("Absolute path to the C# file")] string filePath,
         [Description("0-based start line")] int startLine,
         [Description("0-based start character")] int startCharacter,
@@ -260,40 +299,43 @@ public class CSharpTools
         [Description("Content of the file (optional)")] string? content,
         CancellationToken cancellationToken)
     {
-        var absolutePath = GetAbsolutePath(filePath);
-        await EnsureDocumentOpenAsync(absolutePath, content, cancellationToken);
-
-        var range = new Lsp.Range
+        return ExecuteToolAsync("csharp_code_actions", async ct =>
         {
-            Start = new Position { Line = startLine, Character = startCharacter },
-            End = new Position { Line = endLine, Character = endCharacter }
-        };
+            var absolutePath = GetAbsolutePath(filePath);
+            await EnsureDocumentOpenAsync(absolutePath, content, ct);
 
-        var diagnostics = _lspClient.GetCachedDiagnostics(absolutePath);
-        var relevantDiagnostics = diagnostics?.Diagnostics
-            .Where(d => d.Range.Start.Line >= startLine && d.Range.End.Line <= endLine)
-            .ToArray() ?? Array.Empty<Diagnostic>();
+            var range = new Lsp.Range
+            {
+                Start = new Position { Line = startLine, Character = startCharacter },
+                End = new Position { Line = endLine, Character = endCharacter }
+            };
 
-        var actions = await _lspClient.GetCodeActionsAsync(absolutePath, range, relevantDiagnostics, cancellationToken);
-        if (actions == null || actions.Length == 0)
-            return "No code actions available.";
+            var diagnostics = _lspClient.GetCachedDiagnostics(absolutePath);
+            var relevantDiagnostics = diagnostics?.Diagnostics
+                .Where(d => d.Range.Start.Line >= startLine && d.Range.End.Line <= endLine)
+                .ToArray() ?? Array.Empty<Diagnostic>();
 
-        var sb = new StringBuilder();
-        sb.AppendLine($"Found {actions.Length} code action(s):\n");
+            var actions = await _lspClient.GetCodeActionsAsync(absolutePath, range, relevantDiagnostics, ct);
+            if (actions == null || actions.Length == 0)
+                return "No code actions available.";
 
-        foreach (var action in actions)
-        {
-            sb.AppendLine($"• {action.Title}");
-            if (!string.IsNullOrEmpty(action.Kind))
-                sb.AppendLine($"  Kind: {action.Kind}");
-        }
+            var sb = new StringBuilder();
+            sb.AppendLine($"Found {actions.Length} code action(s):\n");
 
-        return sb.ToString();
+            foreach (var action in actions)
+            {
+                sb.AppendLine($"• {action.Title}");
+                if (!string.IsNullOrEmpty(action.Kind))
+                    sb.AppendLine($"  Kind: {action.Kind}");
+            }
+
+            return sb.ToString();
+        }, cancellationToken);
     }
 
     [McpServerTool(Name = "csharp_rename")]
     [Description("Rename a symbol across the workspace")]
-    public async Task<string> RenameAsync(
+    public Task<string> RenameAsync(
         [Description("Absolute path to the C# file")] string filePath,
         [Description("0-based line number")] int line,
         [Description("0-based character position")] int character,
@@ -301,28 +343,31 @@ public class CSharpTools
         [Description("Content of the file (optional)")] string? content,
         CancellationToken cancellationToken)
     {
-        var absolutePath = GetAbsolutePath(filePath);
-        await EnsureDocumentOpenAsync(absolutePath, content, cancellationToken);
-
-        var edit = await _lspClient.RenameSymbolAsync(absolutePath, line, character, newName, cancellationToken);
-        if (edit == null || edit.Changes == null || edit.Changes.Count == 0)
-            return "Cannot rename symbol at this position.";
-
-        var sb = new StringBuilder();
-        sb.AppendLine($"Rename to '{newName}' would affect:\n");
-
-        var totalEdits = 0;
-        foreach (var (uri, edits) in edit.Changes)
+        return ExecuteToolAsync("csharp_rename", async ct =>
         {
-            var path = new Uri(uri).LocalPath;
-            sb.AppendLine($"• {path}: {edits.Length} edit(s)");
-            totalEdits += edits.Length;
-        }
+            var absolutePath = GetAbsolutePath(filePath);
+            await EnsureDocumentOpenAsync(absolutePath, content, ct);
 
-        sb.AppendLine($"\nTotal: {totalEdits} edit(s) in {edit.Changes.Count} file(s)");
-        sb.AppendLine("\nNote: This is a preview. Apply the rename in your editor to make changes.");
+            var edit = await _lspClient.RenameSymbolAsync(absolutePath, line, character, newName, ct);
+            if (edit == null || edit.Changes == null || edit.Changes.Count == 0)
+                return "Cannot rename symbol at this position.";
 
-        return sb.ToString();
+            var sb = new StringBuilder();
+            sb.AppendLine($"Rename to '{newName}' would affect:\n");
+
+            var totalEdits = 0;
+            foreach (var (uri, edits) in edit.Changes)
+            {
+                var path = new Uri(uri).LocalPath;
+                sb.AppendLine($"• {path}: {edits.Length} edit(s)");
+                totalEdits += edits.Length;
+            }
+
+            sb.AppendLine($"\nTotal: {totalEdits} edit(s) in {edit.Changes.Count} file(s)");
+            sb.AppendLine("\nNote: This is a preview. Apply the rename in your editor to make changes.");
+
+            return sb.ToString();
+        }, cancellationToken);
     }
 
     internal void SetWorkspacePath(string path)
