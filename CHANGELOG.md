@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Use explicit UTF-8 encoding without BOM on LSP process stdin to prevent corrupted Content-Length headers
+- Handle server-to-client requests (e.g. `workspace/configuration`) that require a response, preventing server stalls
+- Wait for workspace `$/progress` end notification before declaring the LSP client initialized
+
 ## [1.0.0] - 2025-12-11
 
 ### Added

@@ -22,6 +22,7 @@ public class LspClient : IAsyncDisposable
     private readonly SemaphoreSlim _initLock = new(1, 1);
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private string? _filteredWorkspacePath;
+    private TaskCompletionSource? _workspaceLoaded = new();
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -76,7 +77,9 @@ public class LspClient : IAsyncDisposable
                 RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
-                // Don't set encoding - we write bytes directly to avoid BOM issues
+                // Use UTF-8 without BOM to prevent StreamWriter.BaseStream from
+                // writing a 3-byte BOM preamble before our Content-Length headers
+                StandardInputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
             };
 
             _lspProcess = new Process { StartInfo = startInfo };
@@ -123,6 +126,23 @@ public class LspClient : IAsyncDisposable
 
             // Send initialized notification
             await SendNotificationAsync("initialized", new { }, cancellationToken);
+
+            // Wait for the workspace to finish loading before declaring ready
+            if (_workspaceLoaded != null)
+            {
+                _logger.LogInformation("Waiting for workspace to finish loading...");
+                using var loadCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                loadCts.CancelAfter(TimeSpan.FromMinutes(2));
+                try
+                {
+                    await _workspaceLoaded.Task.WaitAsync(loadCts.Token);
+                    _logger.LogInformation("Workspace loading completed");
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogWarning("Workspace loading timed out, proceeding anyway");
+                }
+            }
 
             _isInitialized = true;
             return true;
@@ -527,7 +547,7 @@ public class LspClient : IAsyncDisposable
                 _logger.LogTrace("Received: {Message}", json);
                 _logger.LogDebug("ReadLoopAsync: Received message, length={Length}", json.Length);
 
-                ProcessMessage(json);
+                await ProcessMessageAsync(json, cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -542,19 +562,31 @@ public class LspClient : IAsyncDisposable
         _logger.LogDebug("ReadLoopAsync: Exiting read loop");
     }
 
-    private void ProcessMessage(string json)
+    private async Task ProcessMessageAsync(string json, CancellationToken cancellationToken)
     {
         try
         {
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
-            if (root.TryGetProperty("id", out var idElement))
+            var hasId = root.TryGetProperty("id", out var idElement);
+            var hasMethod = root.TryGetProperty("method", out var methodElement);
+
+            if (hasId && hasMethod)
             {
-                // Response to a request
+                // Server-to-client request — must respond or the server will stall
+                var serverReqId = idElement.GetInt32();
+                var method = methodElement.GetString();
+                _logger.LogDebug("Server request: {Method} (id={Id})", method, serverReqId);
+                await SendServerRequestResponseAsync(serverReqId, method, root, cancellationToken);
+            }
+            else if (hasId)
+            {
+                // Response to a client request
                 var id = idElement.GetInt32();
                 if (_pendingRequests.TryGetValue(id, out var tcs))
                 {
+                    // Response to a client request
                     if (root.TryGetProperty("error", out var error))
                     {
                         var errorMsg = error.GetProperty("message").GetString();
@@ -571,9 +603,9 @@ public class LspClient : IAsyncDisposable
                     }
                 }
             }
-            else if (root.TryGetProperty("method", out var methodElement))
+            else if (hasMethod)
             {
-                // Notification from server
+                // Notification from server (no id, no response needed)
                 var method = methodElement.GetString();
                 if (method == "textDocument/publishDiagnostics" && root.TryGetProperty("params", out var @params))
                 {
@@ -586,12 +618,42 @@ public class LspClient : IAsyncDisposable
                             diagnostics.Diagnostics.Length, diagnostics.Uri);
                     }
                 }
+                else if (method == "$/progress" && root.TryGetProperty("params", out var progressParams)
+                    && progressParams.TryGetProperty("value", out var value)
+                    && value.TryGetProperty("kind", out var kind)
+                    && kind.GetString() == "end")
+                {
+                    _workspaceLoaded?.TrySetResult();
+                }
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error processing LSP message");
         }
+    }
+
+    private async Task SendServerRequestResponseAsync(int id, string? method, JsonElement root, CancellationToken cancellationToken)
+    {
+        // workspace/configuration expects an array with one item per requested section
+        object? result = null;
+        if (method == "workspace/configuration" && root.TryGetProperty("params", out var @params)
+            && @params.TryGetProperty("items", out var items))
+        {
+            var count = items.GetArrayLength();
+            var configItems = new object?[count];
+            // Return empty objects so the server gets valid (default) config
+            for (var i = 0; i < count; i++)
+                configItems[i] = new { };
+            result = configItems;
+        }
+
+        var response = new JsonRpcResponse
+        {
+            Id = id,
+            Result = JsonSerializer.SerializeToElement(result, JsonOptions),
+        };
+        await SendMessageAsync(response, cancellationToken);
     }
 
     private static async Task<int?> ReadContentLengthAsync(Stream stream, CancellationToken cancellationToken)
