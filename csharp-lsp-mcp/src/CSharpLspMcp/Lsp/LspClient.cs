@@ -12,7 +12,7 @@ public class LspClient : IAsyncDisposable
     private readonly ILogger<LspClient> _logger;
     private readonly SolutionFilter _solutionFilter;
     private Process? _lspProcess;
-    private Stream? _outputStream;
+    private StreamReader? _outputReader;
     private int _requestId;
     private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonElement>> _pendingRequests = new();
     private readonly ConcurrentDictionary<string, PublishDiagnosticsParams> _diagnosticsCache = new();
@@ -84,7 +84,7 @@ public class LspClient : IAsyncDisposable
             _readLoopCts?.Dispose();
 
             _lspProcess = null;
-            _outputStream = null;
+            _outputReader = null;
             _readLoopCts = null;
             _readLoopTask = null;
             _isInitialized = false;
@@ -141,7 +141,8 @@ public class LspClient : IAsyncDisposable
                 RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
-                // Don't set encoding - we write bytes directly to avoid BOM issues
+                StandardOutputEncoding = new UTF8Encoding(false),
+                StandardErrorEncoding = new UTF8Encoding(false),
             };
 
             _lspProcess = new Process { StartInfo = startInfo };
@@ -158,6 +159,9 @@ public class LspClient : IAsyncDisposable
             }
 
             _logger.LogDebug("LSP process started, PID: {Pid}", _lspProcess.Id);
+
+            // Get the stdout reader BEFORE starting async stderr reads
+            _outputReader = _lspProcess.StandardOutput;
             _lspProcess.BeginErrorReadLine();
 
             // Small delay to let the process start
@@ -168,7 +172,6 @@ public class LspClient : IAsyncDisposable
                 _logger.LogError("LSP process exited immediately with code: {ExitCode}", _lspProcess.ExitCode);
                 return false;
             }
-            _outputStream = _lspProcess.StandardOutput.BaseStream;
 
             _readLoopCts = new CancellationTokenSource();
             _readLoopTask = Task.Run(() => ReadLoopAsync(_readLoopCts.Token), _readLoopCts.Token);
@@ -555,12 +558,43 @@ public class LspClient : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Sends a success response to a server-initiated request (e.g. client/registerCapability).
+    /// Without this, the server blocks waiting for a response and stops processing further requests.
+    /// </summary>
+    private async Task SendServerResponseAsync(int requestId)
+    {
+        // Build JSON manually to ensure "result":null is always present.
+        // Using anonymous types + JsonOptions would strip null via WhenWritingNull.
+        var json = $"{{\"jsonrpc\":\"2.0\",\"id\":{requestId},\"result\":null}}";
+        var bytes = Encoding.UTF8.GetBytes(json);
+        var header = $"Content-Length: {bytes.Length}\r\n\r\n";
+        var headerBytes = Encoding.UTF8.GetBytes(header);
+
+        _logger.LogDebug("Sending response to server request id={Id}", requestId);
+
+        await _writeLock.WaitAsync(CancellationToken.None);
+        try
+        {
+            if (_lspProcess?.StandardInput?.BaseStream == null)
+                return;
+            await _lspProcess.StandardInput.BaseStream.WriteAsync(headerBytes, CancellationToken.None);
+            await _lspProcess.StandardInput.BaseStream.WriteAsync(bytes, CancellationToken.None);
+            await _lspProcess.StandardInput.BaseStream.FlushAsync(CancellationToken.None);
+            _logger.LogTrace("Sent server response: {Message}", json);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     private async Task ReadLoopAsync(CancellationToken cancellationToken)
     {
         _logger.LogDebug("ReadLoopAsync: Starting read loop");
-        if (_outputStream == null)
+        if (_outputReader == null)
         {
-            _logger.LogError("ReadLoopAsync: Output stream is null!");
+            _logger.LogError("ReadLoopAsync: Output reader is null!");
             return;
         }
 
@@ -569,7 +603,7 @@ public class LspClient : IAsyncDisposable
             try
             {
                 _logger.LogDebug("ReadLoopAsync: Waiting for content length header...");
-                var contentLength = await ReadContentLengthAsync(_outputStream, cancellationToken);
+                var contentLength = await ReadContentLengthAsync(_outputReader, cancellationToken);
                 if (contentLength == null)
                 {
                     _logger.LogWarning("ReadLoopAsync: Stream closed (null content length)");
@@ -580,15 +614,20 @@ public class LspClient : IAsyncDisposable
                 if (contentLength.Value <= 0)
                     continue;
 
-                var payload = new byte[contentLength.Value];
-                var readOk = await ReadExactAsync(_outputStream, payload, payload.Length, cancellationToken);
-                if (!readOk)
+                var buffer = new char[contentLength.Value];
+                var totalRead = 0;
+                while (totalRead < contentLength.Value)
                 {
-                    _logger.LogWarning("ReadLoopAsync: Stream closed while reading payload");
-                    return; // Stream closed
+                    var read = await _outputReader.ReadAsync(buffer.AsMemory(totalRead, contentLength.Value - totalRead), cancellationToken);
+                    if (read == 0)
+                    {
+                        _logger.LogWarning("ReadLoopAsync: Stream closed while reading payload");
+                        return;
+                    }
+                    totalRead += read;
                 }
 
-                var json = Encoding.UTF8.GetString(payload);
+                var json = new string(buffer, 0, totalRead);
                 _logger.LogTrace("Received: {Message}", json);
                 _logger.LogDebug("ReadLoopAsync: Received message, length={Length}", json.Length);
 
@@ -614,9 +653,32 @@ public class LspClient : IAsyncDisposable
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
-            if (root.TryGetProperty("id", out var idElement))
+            bool hasId = root.TryGetProperty("id", out var idElement);
+            bool hasMethod = root.TryGetProperty("method", out var methodElement);
+
+            if (hasId && hasMethod)
             {
-                // Response to a request
+                // Server-sent REQUEST (has both id and method) — needs a response
+                var serverRequestId = idElement.GetInt32();
+                var method = methodElement.GetString();
+                _logger.LogDebug("Received server request: id={Id} method={Method}", serverRequestId, method);
+
+                // Send an empty success response so the server doesn't block
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await SendServerResponseAsync(serverRequestId);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to send response to server request id={Id}", serverRequestId);
+                    }
+                });
+            }
+            else if (hasId)
+            {
+                // Response to one of our requests
                 var id = idElement.GetInt32();
                 if (_pendingRequests.TryGetValue(id, out var tcs))
                 {
@@ -635,10 +697,14 @@ public class LspClient : IAsyncDisposable
                         tcs.TrySetResult(default);
                     }
                 }
+                else
+                {
+                    _logger.LogDebug("Received response for unknown request id={Id}", id);
+                }
             }
-            else if (root.TryGetProperty("method", out var methodElement))
+            else if (hasMethod)
             {
-                // Notification from server
+                // Notification from server (has method but no id)
                 var method = methodElement.GetString();
                 if (method == "textDocument/publishDiagnostics" && root.TryGetProperty("params", out var @params))
                 {
@@ -651,6 +717,10 @@ public class LspClient : IAsyncDisposable
                             diagnostics.Diagnostics.Length, diagnostics.Uri);
                     }
                 }
+                else
+                {
+                    _logger.LogDebug("Received notification: {Method}", method);
+                }
             }
         }
         catch (Exception ex)
@@ -659,62 +729,28 @@ public class LspClient : IAsyncDisposable
         }
     }
 
-    private static async Task<int?> ReadContentLengthAsync(Stream stream, CancellationToken cancellationToken)
+    private static async Task<int?> ReadContentLengthAsync(StreamReader reader, CancellationToken cancellationToken)
     {
-        var headerBytes = new List<byte>();
-        var lastFour = new byte[4];
-        var lastIndex = 0;
+        int contentLength = 0;
+        string? line;
 
-        while (true)
+        // Read header lines until we hit the empty line separator (\r\n\r\n)
+        while ((line = await reader.ReadLineAsync(cancellationToken)) != null)
         {
-            var buffer = new byte[1];
-            var read = await stream.ReadAsync(buffer.AsMemory(0, 1), cancellationToken);
-            if (read == 0)
-                return null;
+            if (string.IsNullOrEmpty(line))
+                break; // Empty line = end of headers
 
-            var value = buffer[0];
-            headerBytes.Add(value);
-
-            lastFour[lastIndex % 4] = value;
-            lastIndex++;
-
-            if (lastIndex >= 4 &&
-                lastFour[(lastIndex - 4) % 4] == '\r' &&
-                lastFour[(lastIndex - 3) % 4] == '\n' &&
-                lastFour[(lastIndex - 2) % 4] == '\r' &&
-                lastFour[(lastIndex - 1) % 4] == '\n')
-            {
-                break;
-            }
-        }
-
-        var headerText = Encoding.ASCII.GetString(headerBytes.ToArray()).TrimEnd('\r', '\n');
-        var lines = headerText.Split(new[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
-
-        foreach (var line in lines)
-        {
             if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
             {
                 if (int.TryParse(line.Substring(15).Trim(), out var length))
-                    return length;
+                    contentLength = length;
             }
         }
 
-        return 0;
-    }
+        if (line == null)
+            return null; // Stream closed
 
-    private static async Task<bool> ReadExactAsync(Stream stream, byte[] buffer, int length, CancellationToken cancellationToken)
-    {
-        var totalRead = 0;
-        while (totalRead < length)
-        {
-            var read = await stream.ReadAsync(buffer.AsMemory(totalRead, length - totalRead), cancellationToken);
-            if (read == 0)
-                return false;
-            totalRead += read;
-        }
-
-        return true;
+        return contentLength;
     }
 
     private async Task CleanupFailedStartAsync()
@@ -742,7 +778,7 @@ public class LspClient : IAsyncDisposable
         _lspProcess?.Dispose();
         _readLoopCts?.Dispose();
 
-        _outputStream = null;
+        _outputReader = null;
         _readLoopCts = null;
         _readLoopTask = null;
         _lspProcess = null;
