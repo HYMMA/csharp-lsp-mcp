@@ -160,10 +160,16 @@ public class CSharpTools
             var absolutePath = GetAbsolutePath(filePath);
             await EnsureDocumentOpenAsync(absolutePath, content, ct);
 
-            var hover = await _lspClient.GetHoverAsync(absolutePath, line, character, ct);
-            if (hover == null)
-                return "No hover information available at this position.";
+            var docContent = GetOpenDocumentContent(absolutePath, content);
+            var (hover, winningOffset) = await TryWithToleranceAsync(
+                docContent, line, character,
+                (ch, c) => _lspClient.GetHoverAsync(absolutePath, line, ch, c),
+                ct);
 
+            if (hover == null)
+                return BuildPositionMissMessage("hover information", line, character);
+
+            LogToleranceWin("csharp_hover", character, line, winningOffset);
             return FormatHoverContent(hover.Contents);
         }, cancellationToken);
     }
@@ -219,9 +225,20 @@ public class CSharpTools
             var absolutePath = GetAbsolutePath(filePath);
             await EnsureDocumentOpenAsync(absolutePath, content, ct);
 
-            var locations = await _lspClient.GetDefinitionAsync(absolutePath, line, character, ct);
+            var docContent = GetOpenDocumentContent(absolutePath, content);
+            var (locations, winningOffset) = await TryWithToleranceAsync(
+                docContent, line, character,
+                async (ch, c) =>
+                {
+                    var locs = await _lspClient.GetDefinitionAsync(absolutePath, line, ch, c);
+                    return locs is { Length: > 0 } ? locs : null;
+                },
+                ct);
+
             if (locations == null || locations.Length == 0)
-                return "No definition found.";
+                return BuildPositionMissMessage("definition", line, character);
+
+            LogToleranceWin("csharp_definition", character, line, winningOffset);
 
             var sb = new StringBuilder();
             sb.AppendLine($"Found {locations.Length} definition(s):\n");
@@ -398,6 +415,115 @@ public class CSharpTools
     {
         _workspacePath = path;
     }
+
+    // Same-line position-tolerance ring (kb-4110). AI agents lack a precise editor caret and
+    // routinely miss the target symbol by a character or two, turning a near-miss into a hard
+    // "nothing here" error. On the miss path only, retry a tiny ring of nearby offsets on the
+    // SAME line so tolerance never silently resolves a symbol on an adjacent line. csharp-lsp
+    // positions are 0-based (no 1->0 conversion); the ring operates directly on the character offset.
+    internal static readonly int[] ToleranceDeltas = { 0, -1, 1, -2 };
+
+    /// <summary>
+    /// Number of characters on the given 0-based <paramref name="line"/> of <paramref name="content"/>,
+    /// excluding the line terminator (CRLF-safe). Returns 0 when the content is empty or the line is
+    /// out of range — callers clamp the ring to <c>[0, lineLength]</c> so an out-of-range line yields
+    /// only offset 0.
+    /// </summary>
+    internal static int GetLineLength(string? content, int line)
+    {
+        if (string.IsNullOrEmpty(content) || line < 0)
+            return 0;
+
+        var start = 0;
+        var currentLine = 0;
+        while (currentLine < line)
+        {
+            var nl = content.IndexOf('\n', start);
+            if (nl < 0)
+                return 0; // requested line is past the end of the document
+            start = nl + 1;
+            currentLine++;
+        }
+
+        var end = content.IndexOf('\n', start);
+        if (end < 0)
+            end = content.Length;
+
+        var length = end - start;
+        if (length > 0 && content[start + length - 1] == '\r')
+            length--; // strip the CR of a CRLF terminator
+
+        return length;
+    }
+
+    /// <summary>
+    /// Builds the ordered, deduplicated tolerance ring of character offsets to probe for a
+    /// requested <paramref name="character"/>, each hard-clamped to <c>[0, lineLength]</c> so the
+    /// ring can never cross to an adjacent line. The first element is always the (clamped) exact
+    /// offset, so an exact hit performs exactly one probe.
+    /// </summary>
+    internal static IReadOnlyList<int> BuildToleranceRing(int character, int lineLength)
+    {
+        var ring = new List<int>(ToleranceDeltas.Length);
+        foreach (var delta in ToleranceDeltas)
+        {
+            var candidate = character + delta;
+            if (candidate < 0)
+                candidate = 0;
+            else if (candidate > lineLength)
+                candidate = lineLength;
+
+            if (!ring.Contains(candidate))
+                ring.Add(candidate);
+        }
+
+        return ring;
+    }
+
+    /// <summary>
+    /// Invokes <paramref name="probe"/> across the same-line tolerance ring for the requested
+    /// position, returning the first non-null result and the winning character offset. Stops at
+    /// the first hit, so a successful exact lookup issues no extra queries. On a full miss returns
+    /// <c>(null, character)</c>. The <paramref name="probe"/> is expected to normalize an empty
+    /// result to <c>null</c>.
+    /// </summary>
+    internal static async Task<(T? Result, int WinningOffset)> TryWithToleranceAsync<T>(
+        string? content,
+        int line,
+        int character,
+        Func<int, CancellationToken, Task<T?>> probe,
+        CancellationToken ct) where T : class
+    {
+        var lineLength = GetLineLength(content, line);
+        var ring = BuildToleranceRing(character, lineLength);
+
+        foreach (var offset in ring)
+        {
+            var result = await probe(offset, ct);
+            if (result != null)
+                return (result, offset);
+        }
+
+        return (null, character);
+    }
+
+    private string? GetOpenDocumentContent(string filePath, string? fallback)
+        => _openDocuments.TryGetValue(filePath, out var state) ? state.Content : fallback;
+
+    private void LogToleranceWin(string tool, int requested, int line, int winningOffset)
+    {
+        if (winningOffset != requested)
+        {
+            _logger.LogInformation(
+                "{Tool} resolved via same-line tolerance: requested character {Requested}, winning character {Winning} (line {Line})",
+                tool, requested, winningOffset, line);
+        }
+    }
+
+    private static string BuildPositionMissMessage(string what, int line, int character)
+        => $"No {what} found at line {line}, character {character} after same-line tolerance retry. " +
+           "Positions are 0-based — point `character` at the first letter of the target symbol's name " +
+           "(not whitespace, punctuation, or the end of the token), and confirm `line` is 0-based.";
 
     private async Task EnsureDocumentOpenAsync(string filePath, string? content, CancellationToken ct)
     {
