@@ -178,8 +178,24 @@ OPTIONS:
     -V, --verbose   Enable verbose logging (to stderr)
 
 ENVIRONMENT VARIABLES:
-    MCP_DEBUG=1     Enable trace-level logging
+    MCP_DEBUG=1                  Enable trace-level logging
+    CSHARP_LSP_TOLERANCE_LOG    Path to a JSONL file for position-tolerance telemetry (opt-in)
 ```
+
+### Position tolerance (for AI / MCP callers)
+
+The position-based tools — `csharp_hover`, `csharp_completions`, `csharp_definition`, and
+`csharp_references` — apply a **same-line position-tolerance ring** on the miss path. AI callers
+compute `(line, character)` from text rather than a real editor caret and frequently land a
+character or two off the target symbol. Instead of failing immediately, the server retries a small
+ring of nearby character offsets (`exact, -1, +1, -2`) **on the same line only** — hard-clamped to
+the line so a retry can never resolve a symbol on an adjacent line. An exact hit issues exactly one
+probe, so there is no behavior or performance change when the position is already correct.
+
+Set `CSHARP_LSP_TOLERANCE_LOG` to a file path to record each outcome as a line of JSON
+(`{ ts, tool, line, requested, winning, delta, outcome }`, where `outcome` is `exact`, `tolerance`,
+or `miss`). Grouping the records by `delta` yields a winning-offset histogram for tuning the ring.
+The sink is a no-op when the variable is unset.
 
 ## Architecture
 
