@@ -15,6 +15,7 @@ public class CSharpTools
 {
     private readonly ILogger<CSharpTools> _logger;
     private readonly LspClient _lspClient;
+    private readonly ToleranceTelemetrySink _toleranceSink;
     private readonly Dictionary<string, DocumentState> _openDocuments = new();
     private string? _workspacePath;
 
@@ -26,6 +27,8 @@ public class CSharpTools
     {
         _logger = logger;
         _lspClient = lspClient;
+        // Opt-in JSONL telemetry; a no-op unless CSHARP_LSP_TOLERANCE_LOG is set (see ToleranceTelemetrySink).
+        _toleranceSink = ToleranceTelemetrySink.FromEnvironment();
     }
 
     /// <summary>
@@ -167,9 +170,12 @@ public class CSharpTools
                 ct);
 
             if (hover == null)
+            {
+                RecordToleranceOutcome("csharp_hover", line, character, winning: null);
                 return BuildPositionMissMessage("hover information", line, character);
+            }
 
-            LogToleranceWin("csharp_hover", character, line, winningOffset);
+            RecordToleranceOutcome("csharp_hover", line, character, winningOffset);
             return FormatHoverContent(hover.Contents);
         }, cancellationToken);
     }
@@ -189,9 +195,23 @@ public class CSharpTools
             var absolutePath = GetAbsolutePath(filePath);
             await EnsureDocumentOpenAsync(absolutePath, content, ct);
 
-            var completions = await _lspClient.GetCompletionsAsync(absolutePath, line, character, ct);
+            var docContent = GetOpenDocumentContent(absolutePath, content);
+            var (completions, winningOffset) = await TryWithToleranceAsync(
+                docContent, line, character,
+                async (ch, c) =>
+                {
+                    var items = await _lspClient.GetCompletionsAsync(absolutePath, line, ch, c);
+                    return items is { Length: > 0 } ? items : null;
+                },
+                ct);
+
             if (completions == null || completions.Length == 0)
-                return "No completions available.";
+            {
+                RecordToleranceOutcome("csharp_completions", line, character, winning: null);
+                return BuildPositionMissMessage("completions", line, character);
+            }
+
+            RecordToleranceOutcome("csharp_completions", line, character, winningOffset);
 
             var sb = new StringBuilder();
             sb.AppendLine($"Found {completions.Length} completion(s):\n");
@@ -236,9 +256,12 @@ public class CSharpTools
                 ct);
 
             if (locations == null || locations.Length == 0)
+            {
+                RecordToleranceOutcome("csharp_definition", line, character, winning: null);
                 return BuildPositionMissMessage("definition", line, character);
+            }
 
-            LogToleranceWin("csharp_definition", character, line, winningOffset);
+            RecordToleranceOutcome("csharp_definition", line, character, winningOffset);
 
             var sb = new StringBuilder();
             sb.AppendLine($"Found {locations.Length} definition(s):\n");
@@ -269,9 +292,23 @@ public class CSharpTools
             var absolutePath = GetAbsolutePath(filePath);
             await EnsureDocumentOpenAsync(absolutePath, content, ct);
 
-            var locations = await _lspClient.GetReferencesAsync(absolutePath, line, character, includeDeclaration, ct);
+            var docContent = GetOpenDocumentContent(absolutePath, content);
+            var (locations, winningOffset) = await TryWithToleranceAsync(
+                docContent, line, character,
+                async (ch, c) =>
+                {
+                    var locs = await _lspClient.GetReferencesAsync(absolutePath, line, ch, includeDeclaration, c);
+                    return locs is { Length: > 0 } ? locs : null;
+                },
+                ct);
+
             if (locations == null || locations.Length == 0)
-                return "No references found.";
+            {
+                RecordToleranceOutcome("csharp_references", line, character, winning: null);
+                return BuildPositionMissMessage("references", line, character);
+            }
+
+            RecordToleranceOutcome("csharp_references", line, character, winningOffset);
 
             var sb = new StringBuilder();
             sb.AppendLine($"Found {locations.Length} reference(s):\n");
@@ -510,14 +547,20 @@ public class CSharpTools
     private string? GetOpenDocumentContent(string filePath, string? fallback)
         => _openDocuments.TryGetValue(filePath, out var state) ? state.Content : fallback;
 
-    private void LogToleranceWin(string tool, int requested, int line, int winningOffset)
+    // Surfaces a tolerance outcome two ways: a human-readable ILogger line when the ring actually
+    // recovered the lookup (winning offset differs from the request), and a structured JSONL record
+    // for every outcome (exact / tolerance / miss) when the opt-in telemetry sink is enabled.
+    // A miss is signalled with winning == null.
+    private void RecordToleranceOutcome(string tool, int line, int requested, int? winning)
     {
-        if (winningOffset != requested)
+        if (winning is int w && w != requested)
         {
             _logger.LogInformation(
                 "{Tool} resolved via same-line tolerance: requested character {Requested}, winning character {Winning} (line {Line})",
-                tool, requested, winningOffset, line);
+                tool, requested, w, line);
         }
+
+        _toleranceSink.Record(tool, line, requested, winning);
     }
 
     private static string BuildPositionMissMessage(string what, int line, int character)

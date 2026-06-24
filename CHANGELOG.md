@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Same-line position-tolerance ring for the position-based C# tools (`csharp_definition`,
+  `csharp_hover`, `csharp_references`, `csharp_completions`). On a miss the server retries a small
+  ring of nearby character offsets (`exact, -1, +1, -2`) **on the same line only** (hard-clamped to
+  the line, never crossing onto an adjacent line), which self-heals off-by-one positions supplied by
+  AI / MCP callers that lack a real editor caret. Exact hits issue exactly one probe (no behavior or
+  performance change on the happy path); a recovered lookup is logged via `ILogger`; a true miss
+  returns a recovery-oriented, 0-based message.
+- Opt-in, lock-safe JSONL telemetry sink for tolerance outcomes, activated by the
+  `CSHARP_LSP_TOLERANCE_LOG` environment variable (a no-op when unset). Appends one JSON object per
+  line — `{ ts, tool, line, requested, winning, delta, outcome }` — so the winning-offset histogram
+  (`exact` / `tolerance` / `miss`, grouped by `delta`) can be analyzed to validate the ring.
+
 ## [1.0.0] - 2025-12-11
 
 ### Added
